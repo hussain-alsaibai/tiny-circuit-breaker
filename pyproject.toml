@@ -1,24 +1,36 @@
-[project]
-name = "tiny-circuit-breaker"
-version = "1.0.0"
-description = "Zero-dependency Circuit Breaker. Three-state FSM: CLOSED→OPEN→HALF-OPEN. Thread-safe."
-readme = "README.md"
-license = { text = "MIT" }
-authors = [{ name = "Hussain Al-Saibai", email = "hussain.alsaibai@gmail.com" }]
-requires-python = ">=3.8"
-classifiers = [
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3 :: Only",
-    "Intended Audience :: Developers",
-]
-keywords = ["circuit-breaker", "resilience", "fault-tolerance", "zero-dependency", "stdlib"]
-
-[project.urls]
-Homepage = "https://github.com/hussain-alsaibai/tiny-circuit-breaker"
-
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "tiny-circuit-breaker"
+version = "0.1.0"
+description = "Zero-dependency circuit breaker pattern — sync + async, thread-safe, CLOSED → OPEN → HALF-OPEN"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "OpenClaw", email = "hussain.alsaibai@gmail.com"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+keywords = ["circuit-breaker", "resilience", "fault-tolerance", "async", "stdlib"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
 [tool.setuptools]
-py-modules = ["tiny_circuit_breaker"]
+py-modules = ["circuit_breaker"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
