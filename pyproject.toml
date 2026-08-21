@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tiny-circuit-breaker"
 version = "0.1.0"
-description = "Zero-dependency circuit breaker pattern — sync + async, thread-safe, CLOSED → OPEN → HALF-OPEN"
+description = "Zero-dependency circuit breaker for LLM API calls — thread-safe CLOSED → OPEN → HALF_OPEN state machine"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -22,15 +22,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
-keywords = ["circuit-breaker", "resilience", "fault-tolerance", "async", "stdlib"]
+keywords = ["circuit-breaker", "resilience", "fault-tolerance", "llm", "ai-agents", "stdlib"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest"]
 
 [tool.setuptools]
-py-modules = ["circuit_breaker"]
+py-modules = ["tiny_circuit_breaker"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
-asyncio_mode = "auto"

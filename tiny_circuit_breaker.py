@@ -1,268 +1,231 @@
 """
-tiny-circuit-breaker — Zero-dependency Circuit Breaker.
+tiny-circuit-breaker — Zero-dependency Circuit Breaker for LLM API calls.
 
-Three-state FSM: CLOSED → OPEN → HALF-OPEN → CLOSED.
-Pure Python stdlib. MIT License.
+Three-state FSM: CLOSED -> OPEN -> HALF_OPEN -> CLOSED.
+Pure Python stdlib (time, threading, enum, contextlib). MIT License.
 
-The circuit breaker pattern prevents cascading failures by short-circuiting
-calls to a failing service. When failures exceed a threshold, the circuit
-"opens" and rejects calls immediately. After a timeout, it lets one call
-through ("half-open") to test recovery.
+When an LLM provider goes flaky inside an agent loop, the circuit
+"opens" and rejects calls immediately instead of stacking timeouts
+and burning tokens. After a cooldown, a few probe calls test
+recovery; if they succeed, the circuit closes again.
 
-Usage:
-    cb = CircuitBreaker(failure_threshold=5, recovery_timeout=30)
-    result = cb.call(risky_function, arg1, arg2)
+    from tiny_circuit_breaker import CircuitBreaker, CircuitOpen
+
+    cb = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+    with cb.record():
+        call_llm(prompt)
 """
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Any, Callable, Type, Union
 from contextlib import contextmanager
+from enum import Enum
+from typing import Any, Callable, Dict
 
-import sys
-
-
-# ----------------------------------------------------------------------
-# States
-# ----------------------------------------------------------------------
-
-class State(Enum):
-    CLOSED = auto()
-    OPEN = auto()
-    HALF_OPEN = auto()
+__all__ = ["CircuitState", "CircuitBreaker", "CircuitBreakerError", "CircuitOpen"]
+__version__ = "0.1.0"
 
 
 class CircuitBreakerError(Exception):
-    """Raised when a call is rejected due to an open circuit."""
-    pass
+    """Base error raised by the circuit breaker."""
 
 
 class CircuitOpen(CircuitBreakerError):
-    """The circuit is open; call was rejected."""
-    pass
+    """Raised when a call is rejected because the circuit is OPEN."""
 
 
-class CircuitError(CircuitBreakerError):
-    """Wraps an underlying failure that tripped the circuit."""
-    pass
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
-
-# ----------------------------------------------------------------------
-# Stats
-# ----------------------------------------------------------------------
-
-@dataclass
-class CircuitStats:
-    total_calls: int = 0
-    successful_calls: int = 0
-    failed_calls: int = 0
-    rejected_calls: int = 0
-    opened_at: float | None = None
-
-    @property
-    def failure_rate(self) -> float:
-        denom = self.successful_calls + self.failed_calls
-        return self.failed_calls / denom if denom else 0.0
-
-
-# ----------------------------------------------------------------------
-# CircuitBreaker
-# ----------------------------------------------------------------------
 
 class CircuitBreaker:
-    """
-    A thread-safe circuit breaker.
-
-    Parameters
-    ----------
-    failure_threshold : int
-        Number of consecutive failures before opening the circuit.
-    success_threshold : int
-        Number of consecutive successes in HALF_OPEN before closing.
-    recovery_timeout : float
-        Seconds to wait before transitioning OPEN -> HALF_OPEN.
-    excluded : type or tuple of types
-        Exception types that should NOT trip the circuit.
-    name : str
-        Human-readable name for this circuit.
-    """
+    """Thread-safe circuit breaker. See README.md for details."""
 
     def __init__(
         self,
-        *,
         failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
         success_threshold: int = 2,
-        recovery_timeout: float = 60.0,
-        excluded: Type[Exception] | tuple = (),
-        name: str | None = None,
+        *,
+        excluded=None,
+        name: str = "default",
     ) -> None:
-        self.failure_threshold = failure_threshold
-        self.success_threshold = success_threshold
-        self.recovery_timeout = recovery_timeout
-        self.excluded_exceptions: tuple = (excluded,) if isinstance(excluded, type) else excluded
-        self.name = name or "default"
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be >= 1")
+        if success_threshold < 1:
+            raise ValueError("success_threshold must be >= 1")
+        if half_open_max_calls < 1:
+            raise ValueError("half_open_max_calls must be >= 1")
+        if recovery_timeout <= 0:
+            raise ValueError("recovery_timeout must be > 0")
 
-        self._state = State.CLOSED
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+        self.success_threshold = success_threshold
+        self.name = name
+
+        if excluded is None:
+            self.excluded_exceptions = ()
+        elif isinstance(excluded, type):
+            self.excluded_exceptions = (excluded,)
+        else:
+            self.excluded_exceptions = tuple(excluded)
+
+        self._lock = threading.Lock()
+        self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._success_count = 0
-        self._opened_at: float | None = None
-        self._lock = threading.RLock()
-        self._stats = CircuitStats()
+        self._half_open_calls = 0
+        self._opened_at = None
+        self._last_failure_time = None
+        self._total_calls = 0
+        self._total_failures = 0
+        self._total_successes = 0
+        self._total_rejections = 0
 
-    # ---- Properties ----
+    # -- state accessors --
 
     @property
-    def state(self) -> State:
+    def state(self) -> CircuitState:
+        """Current state, applying any time-based transitions."""
         with self._lock:
-            self._check_transition()
+            self._maybe_half_open()
             return self._state
 
-    @property
-    def stats(self) -> CircuitStats:
+    def can_execute(self) -> bool:
+        """True if a call may proceed. False only when OPEN and within recovery timeout."""
         with self._lock:
-            return CircuitStats(
-                total_calls=self._stats.total_calls,
-                successful_calls=self._stats.successful_calls,
-                failed_calls=self._stats.failed_calls,
-                rejected_calls=self._stats.rejected_calls,
-                opened_at=self._opened_at,
-            )
+            self._maybe_half_open()
+            return self._state != CircuitState.OPEN
 
-    def is_closed(self) -> bool:
-        return self.state == State.CLOSED
+    # -- manual recording --
 
-    def is_open(self) -> bool:
-        return self.state == State.OPEN
-
-    def is_half_open(self) -> bool:
-        return self.state == State.HALF_OPEN
-
-    def available(self) -> bool:
-        """True if the circuit allows a call through."""
-        return self.state != State.OPEN
-
-    def reset(self) -> None:
-        """Manually reset the circuit to CLOSED."""
+    def success(self) -> None:
+        """Record a success. Decrements failure counter; in HALF_OPEN may close circuit."""
         with self._lock:
-            self._state = State.CLOSED
-            self._failure_count = 0
-            self._success_count = 0
-            self._opened_at = None
-            self._stats = CircuitStats()
-
-    # ---- State transitions ----
-
-    def _check_transition(self) -> None:
-        """Check if OPEN -> HALF_OPEN transition should fire."""
-        if self._state == State.OPEN and self._opened_at is not None:
-            if time.monotonic() - self._opened_at >= self.recovery_timeout:
-                self._state = State.HALF_OPEN
-                self._success_count = 0
-
-    def _trip(self) -> None:
-        self._state = State.OPEN
-        self._opened_at = time.monotonic()
-
-    def _record_success(self) -> None:
-        with self._lock:
-            self._stats.successful_calls += 1
-            if self._state == State.HALF_OPEN:
+            self._maybe_half_open()
+            self._total_successes += 1
+            if self._state == CircuitState.HALF_OPEN:
                 self._success_count += 1
                 if self._success_count >= self.success_threshold:
-                    self._state = State.CLOSED
-                    self._failure_count = 0
-                    self._success_count = 0
-                    self._opened_at = None
+                    self._close()
+            elif self._failure_count > 0:
+                self._failure_count -= 1
 
-    def _record_failure(self) -> None:
+    def failure(self) -> None:
+        """Record a failure. May open the circuit (or re-open from HALF_OPEN)."""
         with self._lock:
-            self._stats.failed_calls += 1
+            self._maybe_half_open()
+            self._total_failures += 1
             self._failure_count += 1
-            if self._failure_count >= self.failure_threshold:
-                self._trip()
+            self._success_count = 0
+            self._last_failure_time = time.monotonic()
+            if self._state == CircuitState.HALF_OPEN:
+                self._open()  # any probe failure trips it back
+            elif (
+                self._state == CircuitState.CLOSED
+                and self._failure_count >= self.failure_threshold
+            ):
+                self._open()
 
-    def _record_rejected(self) -> None:
-        with self._lock:
-            self._stats.rejected_calls += 1
-
-    # ---- Context manager ----
-
-    def __enter__(self) -> "CircuitBreaker":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """Exit the context manager. Returns True to suppress the exception."""
-        if exc_type is None:
-            # No exception — success path
-            self._record_success()
-        elif isinstance(exc_val, self.excluded_exceptions):
-            # Excluded exception — don't trip, don't suppress
-            pass
-        else:
-            # Failure path
-            self._record_failure()
-        # Never suppress the original exception
-        return False
-
-    # ---- Direct call ----
-
-    def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """
-        Execute `func` through the circuit breaker.
-
-        Raises CircuitOpen if the circuit is open.
-        Raises CircuitError wrapping the original exception on failure.
-        """
-        with self._lock:
-            self._stats.total_calls += 1
-
-        if not self.available():
-            self._record_rejected()
-            raise CircuitOpen(
-                f"Circuit {self.name!r} is OPEN. Call rejected."
-            )
-
-        try:
-            result = func(*args, **kwargs)
-            self._record_success()
-            return result
-        except self.excluded_exceptions:
-            raise
-        except Exception as exc:
-            self._record_failure()
-            raise CircuitError(f"Circuit {self.name!r} caught: {exc}") from exc
-
-    def run(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """Alias for call()."""
-        return self.call(func, *args, **kwargs)
-
-    # ---- Guard context manager ----
+    # -- context manager --
 
     @contextmanager
-    def guard(self):
-        """
-        Context manager that records success/failure on exit.
+    def record(self):
+        """``with cb.record(): call_llm(prompt)``. Raises CircuitOpen
+        if OPEN; records success/failure on exit."""
+        with self._lock:
+            self._maybe_half_open()
+            if self._state == CircuitState.OPEN:
+                self._total_rejections += 1
+                raise CircuitOpen(f"circuit {self.name!r} is OPEN — call rejected")
+            self._total_calls += 1
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_calls += 1
 
-        Usage:
-            with cb.guard():
-                risky_call()
-        """
         try:
-            yield self
-        except BaseException as e:
-            if isinstance(e, self.excluded_exceptions):
-                raise
-            self._record_failure()
+            yield None
+        except self.excluded_exceptions:
             raise
+        except BaseException:
+            self.failure()
+            raise
+        self.success()
 
-    # ---- Repr ----
+    def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Execute ``func`` through the breaker."""
+        with self.record():
+            return func(*args, **kwargs)
 
-    def __repr__(self) -> str:
+    # -- stats / reset --
+
+    def stats(self) -> Dict[str, Any]:
+        """Snapshot of breaker statistics."""
+        with self._lock:
+            self._maybe_half_open()
+            denom = self._total_successes + self._total_failures
+            failure_rate = self._total_failures / denom if denom > 0 else 0.0
+            last_fail_wall = None
+            if self._last_failure_time is not None:
+                last_fail_wall = time.time() - (
+                    time.monotonic() - self._last_failure_time
+                )
+            return {
+                "state": self._state,
+                "failure_count": self._failure_count,
+                "success_count": self._success_count,
+                "last_failure_time": last_fail_wall,
+                "total_calls": self._total_calls,
+                "total_failures": self._total_failures,
+                "total_successes": self._total_successes,
+                "total_rejections": self._total_rejections,
+                "failure_rate": failure_rate,
+            }
+
+    def reset(self) -> None:
+        """Reset to CLOSED with zero consecutive-failure counters."""
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._half_open_calls = 0
+            self._opened_at = None
+            self._last_failure_time = None
+
+    # -- internal helpers --
+
+    def _open(self) -> None:
+        self._state = CircuitState.OPEN
+        self._opened_at = time.monotonic()
+        self._success_count = 0
+        self._half_open_calls = 0
+
+    def _close(self) -> None:
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._half_open_calls = 0
+        self._opened_at = None
+
+    def _maybe_half_open(self) -> None:
+        if (
+            self._state == CircuitState.OPEN
+            and self._opened_at is not None
+            and time.monotonic() - self._opened_at >= self.recovery_timeout
+        ):
+            self._state = CircuitState.HALF_OPEN
+            self._success_count = 0
+            self._half_open_calls = 0
+
+    def __repr__(self) -> str:  # pragma: no cover
         return (
-            f"CircuitBreaker(name={self.name!r}, state={self.state.name}, "
-            f"failures={self._failure_count}/{self.failure_threshold}, "
-            f"recovery_timeout={self.recovery_timeout}s)"
+            f"CircuitBreaker(name={self.name!r}, "
+            f"state={self.state.value}, "
+            f"failures={self._failure_count}/{self.failure_threshold})"
         )
