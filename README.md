@@ -1,7 +1,7 @@
 # tiny-circuit-breaker
 
-[![PyPI](https://img.shields.io/pypi/v/tiny-circuit-breaker.svg)](https://pypi.org/project/tiny-circuit-breaker/)
-[![Python](https://img.shields.io/pypi/pyversions/tiny-circuit-breaker.svg)](https://pypi.org/project/tiny-circuit-breaker/)
+[![Install from GitHub](https://img.shields.io/badge/install-git%2Bhttps-blue)](https://github.com/hussain-alsaibai/tiny-circuit-breaker#install)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/hussain-alsaibai/tiny-circuit-breaker#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
 [![CI](https://github.com/hussain-alsaibai/tiny-circuit-breaker/actions/workflows/ci.yml/badge.svg)](https://github.com/hussain-alsaibai/tiny-circuit-breaker/actions)
