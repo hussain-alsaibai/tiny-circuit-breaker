@@ -13,7 +13,8 @@ any other unreliable dependency) inside an AI agent loop. Prevents
 cascading failures when your provider goes down or rate-limits you.
 
 ```bash
-pip install tiny-circuit-breaker
+# From GitHub (recommended -- not yet on PyPI)
+pip install git+https://github.com/hussain-alsaibai/tiny-circuit-breaker.git
 ```
 
 ---
